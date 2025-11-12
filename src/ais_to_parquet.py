@@ -5,7 +5,9 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import MinMaxScaler
 import os
+import shutil
 from glob import glob
+from pathlib import Path
 
 n = 0
 
@@ -209,17 +211,86 @@ def extract_stationary_data(file_path):
         except Exception as e:
             print(f"Error overwriting {file}: {e}")
 
-#def scale_cols():
-#    scale_cols = [
-#        'Latitude', 'Longitude', 'SOG', 'COG', 'ROT', 'Heading', 
-#        'Width', 'Length', 'Draught', 'dt', 'dLat', 'dLon', 
-#        'Velocity_N', 'Velocity_E'
-#    ]
+def delete_stationary_data(file_path):
+    deleted_count = 0
 
-#    scaler = MinMaxScaler()
+    # Use glob to find matching files recursively
+    pattern = os.path.join(file_path, '**', '*stationary*.parquet')
+    for parquet_file in glob(pattern, recursive=True):
+        os.remove(parquet_file)
+        deleted_count += 1
 
-#    df[scale_cols] = scaler.fit_transform(df[scale_cols])
+    print(f"\nTotal files deleted: {deleted_count}")
 
+def reorganize_parquet_pairs(root_path):
+    root_path = Path(root_path)
+
+    for mmsi_folder in root_path.glob("MMSI=*"):
+        if not mmsi_folder.is_dir():
+            continue
+        
+        print(f"Processing {mmsi_folder.name}...")
+        
+        # Collect all parquet files under this MMSI folder (recursively)
+        parquet_files = list(mmsi_folder.rglob("*.parquet"))
+        
+        # Build a dict of base name -> both files (normal + stationary)
+        file_pairs = {}
+        for pf in parquet_files:
+            name = pf.stem.replace("_stationary", "")
+            file_pairs.setdefault(name, []).append(pf)
+        
+        # Create new Segment folders for each pair
+        for i, (basename, files) in enumerate(sorted(file_pairs.items()), start=1):
+            segment_folder = mmsi_folder / f"Segment={i}"
+            segment_folder.mkdir(exist_ok=True)
+            
+            for f in files:
+                dest = segment_folder / f.name
+                # Move the file to the new segment folder
+                shutil.move(str(f), dest)
+        
+        # Clean up: remove old segment folders if they’re empty
+        for old_segment in mmsi_folder.glob("Segment=*"):
+            if not any(old_segment.iterdir()):
+                old_segment.rmdir()
+    
+    print("✅ Reorganization complete.")
+
+def get_folder_size(path):
+    path = Path(path)
+    total = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+    print(f"Size: {total / (1024 ** 2):.2f} MB")
+
+def count_parquet_pairs(root_path):
+    root_path = Path(root_path)
+    total_pairs = 0
+    details = {}
+
+    for mmsi_folder in root_path.glob("MMSI=*"):
+        if not mmsi_folder.is_dir():
+            continue
+        
+        # Find all parquet files under this MMSI folder (recursively)
+        parquet_files = list(mmsi_folder.rglob("*.parquet"))
+        
+        # Group by base name (ignoring _stationary)
+        file_pairs = {}
+        for f in parquet_files:
+            base = f.stem.replace("_stationary", "")
+            file_pairs.setdefault(base, []).append(f)
+        
+        # Count valid pairs (both normal + stationary exist)
+        pair_count = sum(1 for files in file_pairs.values() if len(files) == 2)
+        total_pairs += pair_count
+        details[mmsi_folder.name] = pair_count
+
+    print("Pair count by MMSI folder:")
+    for k, v in details.items():
+        print(f"  {k}: {v} pairs")
+
+    print(f"\nTotal parquet pairs across all MMSI folders: {total_pairs}")
+    return total_pairs
 
 if __name__ == "__main__":
     ais_folder_path = os.path.join(os.path.dirname(__file__), '../data/csvs/')
@@ -230,6 +301,10 @@ if __name__ == "__main__":
         if filename.endswith('.csv'):
             file_path = os.path.join(ais_folder_path, filename)
             ais_to_parque(file_path, parquet_folder_path)
-            extract_stationary_data(parquet_folder_path)
+
+    delete_stationary_data(parquet_folder_path)
+    extract_stationary_data(parquet_folder_path)
+
+    reorganize_parquet_pairs(parquet_folder_path)
 
     #test MMSI=538009531
