@@ -113,7 +113,7 @@ def ais_to_parque(file_path, out_path):
     df['Segment'] = df.groupby('MMSI')['Timestamp'].transform(
         lambda x: (x.diff().dt.total_seconds().fillna(0) >= 15 * 60).cumsum())  # Max allowed timegap
 
-    #
+    #transform
     knots_to_ms = 0.514444
     df["SOG"] = knots_to_ms * df["SOG"]
 
