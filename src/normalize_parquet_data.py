@@ -4,7 +4,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-ROOT_DIR = os.path.join(os.path.dirname(__file__), '../data/csvs/parquets/')
+ROOT_DIR = os.path.join(os.path.dirname(__file__), '../csvs/parquets/')
 OUTPUT_INFO_FILE = os.path.join(ROOT_DIR, "normalization_info.json")
 
 def is_valid_parquet_file(file_path: str) -> bool:

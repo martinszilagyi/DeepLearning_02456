@@ -146,10 +146,6 @@ def ais_to_parque(file_path, out_path):
     # recalculate the delta time <- ensure it's < 60
     df = df.drop(columns=["dt"])
     df['dt'] = df.groupby(['MMSI', 'Segment'])['Timestamp'].diff().dt.total_seconds().fillna(0)
-    
-    # Calculate Lat/Lon Change (dLat, dLon)
-    df['dLat'] = df.groupby(['MMSI', 'Segment'])['Latitude'].diff().fillna(0)
-    df['dLon'] = df.groupby(['MMSI', 'Segment'])['Longitude'].diff().fillna(0)
 
     # Velocity Components (Requires SOG in m/s)
     # Note: COG is usually 0-360 degrees. Convert to radians for sin/cos.
@@ -158,6 +154,7 @@ def ais_to_parque(file_path, out_path):
     df['Velocity_E'] = df['SOG'] * np.sin(df['COG_rad']) # East component (Longitude direction)
     df.drop(columns=['COG_rad'], inplace=True)
 
+    df = merge_stationary_into_df(df)
     table = pyarrow.Table.from_pandas(df, preserve_index=False)
     pyarrow.parquet.write_to_dataset(
         table,
@@ -254,13 +251,53 @@ def reorganize_parquet_pairs(root_path):
         for old_segment in mmsi_folder.glob("Segment=*"):
             if not any(old_segment.iterdir()):
                 old_segment.rmdir()
-    
-    print("✅ Reorganization complete.")
 
 def get_folder_size(path):
     path = Path(path)
     total = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
     print(f"Size: {total / (1024 ** 2):.2f} MB")
+
+def merge_stationary_into_df(df):
+    """
+    Extract stationary ship properties for each MMSI and
+    merge them back into the original dataframe.
+    """
+
+    stationary_cols = ["Ship type", "Cargo type", "Width", "Length", "Draught"]
+
+    out = []
+
+    # Process one MMSI at a time
+    for mmsi, g in df.groupby("MMSI"):
+        ship_info = {}
+
+        for col in stationary_cols:
+            if col not in g.columns:
+                ship_info[col] = None
+                continue
+
+            valid = g[col][
+                g[col].notnull() &
+                (g[col] != 0) &
+                (g[col].astype(str).str.lower() != "undefined")
+            ]
+
+            ship_info[col] = valid.iloc[0] if not valid.empty else None
+
+        # Convert to dataframe
+        stat_df = pd.DataFrame([ship_info])
+        stat_df["MMSI"] = mmsi
+
+        out.append(stat_df)
+
+    # Combine stationary table
+    stationary_table = pd.concat(out, ignore_index=True)
+
+    # Merge back into original
+    df = df.drop(columns=stationary_cols, errors="ignore")
+    df = df.merge(stationary_table, on="MMSI", how="left")
+
+    return df
 
 def count_parquet_pairs(root_path):
     root_path = Path(root_path)
@@ -293,7 +330,7 @@ def count_parquet_pairs(root_path):
     return total_pairs
 
 if __name__ == "__main__":
-    ais_folder_path = os.path.join(os.path.dirname(__file__), '../data/csvs/')
+    ais_folder_path = os.path.join(os.path.dirname(__file__), '../csvs/')
     parquet_folder_path = os.path.join(ais_folder_path, 'parquets/')
     os.makedirs(parquet_folder_path, exist_ok=True)
 
@@ -302,9 +339,9 @@ if __name__ == "__main__":
             file_path = os.path.join(ais_folder_path, filename)
             ais_to_parque(file_path, parquet_folder_path)
 
-    delete_stationary_data(parquet_folder_path)
-    extract_stationary_data(parquet_folder_path)
+    #delete_stationary_data(parquet_folder_path)
+    #extract_stationary_data(parquet_folder_path)
 
-    reorganize_parquet_pairs(parquet_folder_path)
+    #reorganize_parquet_pairs(parquet_folder_path)
 
     #test MMSI=538009531
