@@ -1,22 +1,30 @@
 {
-    "root_directory": "/zhome/fe/e/213609/DeepLearning/src/../data/csvs/parquets/",
-    "num_files": 8165,
+    "root_directory": "D:\\OneDrivePath\\OneDrive\\DeepLearning\\src\\../csvs/parquets/",
+    "num_files": 13389,
     "columns": {
         "COG": {
             "min": 0.0,
             "max": 359.9
+        },
+        "Draught": {
+            "min": 0.2,
+            "max": 25.5
         },
         "Heading": {
             "min": 0.0,
             "max": 494.0
         },
         "Latitude": {
-            "min": 51.271528,
+            "min": 51.1395,
             "max": 59.307808
+        },
+        "Length": {
+            "min": 3.0,
+            "max": 400.0
         },
         "Longitude": {
             "min": 0.0002,
-            "max": 18.4068
+            "max": 19.6405
         },
         "ROT": {
             "min": -708.7,
@@ -27,20 +35,16 @@
             "max": 25.30032685536723
         },
         "Velocity_E": {
-            "min": -21.84136267173012,
-            "max": 21.69860954010995
+            "min": -23.368112314406027,
+            "max": 22.096534821902235
         },
         "Velocity_N": {
             "min": -23.214690172923763,
             "max": 23.337468236824865
         },
-        "dLat": {
-            "min": -4.265501999999998,
-            "max": 4.265599999999999
-        },
-        "dLon": {
-            "min": -12.030897,
-            "max": 12.031379999999999
+        "Width": {
+            "min": 1.0,
+            "max": 88.0
         },
         "dt": {
             "min": 0.0,

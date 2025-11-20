@@ -9,16 +9,11 @@ import shutil
 from glob import glob
 from pathlib import Path
 
-n = 0
-
 def resample_data(df):
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     non_numeric_cols = df.select_dtypes(exclude=[np.number]).columns
 
     def interpolate_group(g):
-        global n
-        n = n + 1
-        print(f"We are at the {n}th MMSI")
         inserted_rows = []
         for i in range(len(g) - 1):
             row_current = g.iloc[i]
@@ -339,6 +334,7 @@ if __name__ == "__main__":
             file_path = os.path.join(ais_folder_path, filename)
             ais_to_parque(file_path, parquet_folder_path)
 
+    print("Parqueting done")
     #delete_stationary_data(parquet_folder_path)
     #extract_stationary_data(parquet_folder_path)
 
