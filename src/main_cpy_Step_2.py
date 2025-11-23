@@ -14,98 +14,110 @@ num_ship_types = 0
 num_cargo_types = 0
 
 class Seq2SeqTrajectoryModel(nn.Module):
-    """
-    NEW NN: Encoder LSTM → Static Encoder → MLP Decoder (no autoregressive loop)
-    Predicts all 50 future (lat, lon) in one forward pass.
-    Fully compatible with your training/validation/eval loops.
-    """
     def __init__(self,
                  num_dynamic_features=10,
                  cat_static_cardinalities=[None, None],
                  cat_static_emb_dims=[8, 8],
                  num_static_numeric=3,
-                 encoder_hidden_size=128,
-                 lstm_layers=2,
-                 output_size=2,
+                 encoder_hidden_size=64,
+                 decoder_hidden_size=64,
+                 lstm_layers=1,
+                 output_size=2,          # lat, lon per step
                  forecast_steps=50):
         super().__init__()
+        self.fc_init_hidden = nn.Linear(encoder_hidden_size + decoder_hidden_size, decoder_hidden_size)
 
         self.forecast_steps = forecast_steps
-        self.output_size = output_size
 
         # Embeddings for static categorical features
         self.embeddings = nn.ModuleList([
             nn.Embedding(card, dim) for card, dim in zip(cat_static_cardinalities, cat_static_emb_dims)
         ])
 
-        self.norm_enc = nn.LayerNorm(encoder_hidden_size)
-        self.norm_static = nn.LayerNorm(64)
-
         # Encoder LSTM for dynamic input
-        self.encoder_lstm = nn.LSTM(
-            input_size=num_dynamic_features,
-            hidden_size=encoder_hidden_size,
-            num_layers=lstm_layers,
-            batch_first=True
-        )
+        self.encoder_lstm = nn.LSTM(num_dynamic_features, encoder_hidden_size, lstm_layers, batch_first=True)
 
-        # Static feature encoder
+        # FC for static numeric + embedded categorical
         static_emb_dim = sum(cat_static_emb_dims)
         self.fc_static = nn.Sequential(
-            nn.Linear(static_emb_dim + num_static_numeric, 64),
+            nn.Linear(static_emb_dim + num_static_numeric, decoder_hidden_size),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(decoder_hidden_size, decoder_hidden_size),
             nn.ReLU()
         )
 
-        # Final fused encoder → decoder MLP
-        self.fc_fusion = nn.Sequential(
-            nn.Linear(encoder_hidden_size + 64, 256),
-            nn.ReLU(),
-            nn.Linear(256, 256),
-            nn.ReLU(),
-            nn.Linear(256, forecast_steps * output_size)
-        )
+        # Decoder LSTM input size: previous point (2) + static features (decoder_hidden_size)
+        self.decoder_lstm = nn.LSTM(input_size=2 + decoder_hidden_size,
+                                    hidden_size=decoder_hidden_size,
+                                    num_layers=lstm_layers,
+                                    batch_first=True)
 
-    def forward(self, x_dynamic, x_static_cats, x_static_nums, y_target=None, teacher_forcing_ratio=0.0):
+        # Output layer to predict lat/lon at each decoder step
+        self.output_fc = nn.Linear(decoder_hidden_size, output_size)
+
+    def forward(self, x_dynamic, x_static_cats, x_static_nums, y_target=None, teacher_forcing_ratio=0.5):
         """
-        NOTE:
-        - teacher_forcing_ratio is ignored (we predict in one shot)
-        - This keeps full compatibility with your existing pipeline
+        x_dynamic: (batch, seq_len, num_dynamic_features)
+        x_static_cats: list of (batch,) tensors
+        x_static_nums: (batch, num_static_numeric)
+        y_target: (batch, forecast_steps, 2) or None during inference
+        teacher_forcing_ratio: probability to use ground truth as next input during training
         """
 
         batch_size = x_dynamic.size(0)
 
-        # --- Encode static categorical ---
-        embedded_static = [emb(cat) for emb, cat in zip(self.embeddings, x_static_cats)]
-        static_cat_emb = torch.cat(embedded_static, dim=-1)
+        # Embed static categorical features
+        embedded = [emb(cat) for emb, cat in zip(self.embeddings, x_static_cats)]
+        static_cat_emb = torch.cat(embedded, dim=-1)
 
-        # --- Combine static numeric + categorical ---
+        # Static features combined and projected for decoder init and input
         static_feat = torch.cat([static_cat_emb, x_static_nums], dim=-1)
-        static_vec = self.fc_static(static_feat)
+        static_context = self.fc_static(static_feat)  # (batch, decoder_hidden_size)
 
-        # Normalize static vector
-        static_vec = self.norm_static(static_vec)
+        # Encoder
+        encoder_outputs, (hidden, cell) = self.encoder_lstm(x_dynamic)  # hidden/cell: (layers, batch, hidden_size)
 
-        # --- Encode sequence using packed sequence (handles padding correctly) ---
-        lengths = (x_dynamic.abs().sum(dim=-1) != 0).sum(dim=1)
-        packed = nn.utils.rnn.pack_padded_sequence(
-            x_dynamic, lengths.cpu(), batch_first=True, enforce_sorted=False
-        )
-        _, (h_T, _) = self.encoder_lstm(packed)
-        seq_vec = h_T[-1]
+        # Initialize decoder hidden state by combining encoder hidden and static context
+        # For simplicity, use static context to replace decoder initial hidden state for all layers
+        # Combine encoder hidden and static context to initialize decoder hidden state
+        combined = torch.cat([hidden[-1], static_context], dim=1)  # (batch, encoder_hidden_size + decoder_hidden_size)
 
-        # Normalize sequence encoder output
-        seq_vec = self.norm_enc(seq_vec)
+        # Pass through a linear layer (define this in __init__)
+        init_hidden = self.fc_init_hidden(combined)  # (batch, decoder_hidden_size)
 
-        # --- Fuse ---
-        fused = torch.cat([seq_vec, static_vec], dim=-1)
+        decoder_hidden = init_hidden.unsqueeze(0).repeat(self.decoder_lstm.num_layers, 1, 1)  # (layers, batch, hidden_size)
 
-        # --- Decode all 50 steps ---
-        out = self.fc_fusion(fused)
-        out = out.view(batch_size, self.forecast_steps, self.output_size)
-        return out
+        # Optionally keep cell state zeros or do a similar initialization
+        decoder_cell = torch.zeros_like(decoder_hidden)
 
+        # Prepare decoder inputs
+        outputs = torch.zeros(batch_size, self.forecast_steps, 2, device=x_dynamic.device)
+
+        # Initial input to decoder: last point of input dynamic sequence (lat, lon)
+        # Assuming dynamic features: Latitude and Longitude are first two columns
+        decoder_input = x_dynamic[:, -1, :2]  # (batch, 2)
+
+        for t in range(self.forecast_steps):
+            # Concatenate decoder input and static context for LSTM input
+            decoder_lstm_input = torch.cat([decoder_input, static_context], dim=1).unsqueeze(1)  # (batch, 1, 2 + hidden_size)
+
+            # Run one step of decoder LSTM
+            decoder_output, (decoder_hidden, decoder_cell) = self.decoder_lstm(decoder_lstm_input, (decoder_hidden, decoder_cell))
+
+            # Predict next position
+            pred = self.output_fc(decoder_output.squeeze(1))  # (batch, 2)
+
+            outputs[:, t, :] = pred
+
+            # Decide next decoder input: teacher forcing or own prediction
+            if self.training and y_target is not None and torch.rand(1).item() < teacher_forcing_ratio:
+                # Use ground truth next point as next input
+                decoder_input = y_target[:, t, :]
+            else:
+                # Use model prediction as next input
+                decoder_input = pred
+
+        return outputs
 
 class TrajectoryDataset(Dataset):
     def __init__(self, sequences, input_ratio=0.5, forecast_steps=50):
@@ -341,17 +353,18 @@ def main():
         cat_static_emb_dims=[8, 8],
         num_static_numeric=3,
         encoder_hidden_size=256,
-        lstm_layers=3,
+        decoder_hidden_size=256,
+        lstm_layers=5,
         output_size=2,
         forecast_steps=50
-    )   
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
 
-    epochs = 500
+    epochs = 10
     for epoch in range(epochs):
         train_loss = train_loop(model, train_dl, optimizer, criterion, device)
         print(f"Epoch {epoch+1}/{epochs} Train Loss: {train_loss:.10f}")

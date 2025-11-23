@@ -23,6 +23,7 @@ def visualize_sequences(json_filepath, output_html="sequences_map.html"):
     # Compute overall average location for initial map center
     all_coords = []
     for seq in data:
+        all_coords.extend(denormalize_coords(seq["known_path"]))     # include known_path here for centering
         all_coords.extend(denormalize_coords(seq["ground_truth"]))
         all_coords.extend(denormalize_coords(seq["prediction"]))
     avg_lat = sum(lat for lat, lon in all_coords) / len(all_coords)
@@ -36,8 +37,18 @@ def visualize_sequences(json_filepath, output_html="sequences_map.html"):
         seq_id = seq.get("sequence_id", "N/A")
         
         # Denormalize points
+        known_coords = denormalize_coords(seq["known_path"])
         gt_coords = denormalize_coords(seq["ground_truth"])
         pred_coords = denormalize_coords(seq["prediction"])
+        
+        # Add known path polyline (blue)
+        folium.PolyLine(
+            known_coords,
+            color="blue",
+            weight=3,
+            opacity=0.7,
+            tooltip=f"Sequence {seq_id} Known Path"
+        ).add_to(m)
         
         # Add ground truth polyline (green)
         folium.PolyLine(
