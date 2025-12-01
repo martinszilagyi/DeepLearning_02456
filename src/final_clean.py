@@ -10,7 +10,7 @@ def reorganize_parquet_files():
         if not os.path.isdir(mmsi_path):
             continue
         
-        # Collect all parquet files and their original parent folders
+        # Collect all parquet files grouped by original segment folder
         parquet_files = []
         for segment_folder in os.listdir(mmsi_path):
             segment_path = os.path.join(mmsi_path, segment_folder)
@@ -20,20 +20,23 @@ def reorganize_parquet_files():
                 if file.endswith('.parquet'):
                     parquet_files.append((os.path.join(segment_path, file), segment_path))
         
-        # Create new segment folders and move files first
+        # Create segment folders once per MMSI and move files accordingly
+        segment_folder_created = set()
         for i, (parquet_file, _) in enumerate(parquet_files, start=1):
             new_segment_path = os.path.join(mmsi_path, f'segment={i}')
-            os.makedirs(new_segment_path, exist_ok=True)
+            if new_segment_path not in segment_folder_created:
+                os.makedirs(new_segment_path, exist_ok=True)
+                segment_folder_created.add(new_segment_path)
             shutil.move(parquet_file, os.path.join(new_segment_path, os.path.basename(parquet_file)))
         
-        # Now remove old segment folders if empty
+        # Remove old segment folders if empty
         for segment_folder in os.listdir(mmsi_path):
             segment_path = os.path.join(mmsi_path, segment_folder)
             if os.path.isdir(segment_path):
                 try:
                     os.rmdir(segment_path)  # only removes if empty
                 except OSError:
-                    pass  # folder not empty, or other error
+                    pass  # folder not empty or other error
 
     print("Reorganization complete.")
 
@@ -43,7 +46,11 @@ def gather_unique_values(root_folder):
         for file in filenames:
             if file.endswith('.parquet'):
                 path = os.path.join(dirpath, file)
-                df = pd.read_parquet(path)
+                try:
+                    df = pd.read_parquet(path)
+                except Exception as e:
+                    print(f"Warning: Failed to read {path}: {e}")
+                    continue
                 if 'Timestamp' in df.columns:
                     df = df.drop(columns=['Timestamp'])
                 non_numeric_cols = df.select_dtypes(exclude='number').columns
@@ -65,7 +72,11 @@ def apply_enumeration(root_folder, enum_maps):
         for file in filenames:
             if file.endswith('.parquet'):
                 path = os.path.join(dirpath, file)
-                df = pd.read_parquet(path)
+                try:
+                    df = pd.read_parquet(path)
+                except Exception as e:
+                    print(f"Warning: Failed to read {path}: {e}")
+                    continue
                 if 'Timestamp' in df.columns:
                     df = df.drop(columns=['Timestamp'])
                 for col, mapping in enum_maps.items():
@@ -73,7 +84,10 @@ def apply_enumeration(root_folder, enum_maps):
                         df[f'{col}_enum'] = df[col].map(mapping).fillna(-1).astype(int)  # -1 for unknowns
                         orig = df.pop(col)
                         df[col] = orig
-                df.to_parquet(path)
+                try:
+                    df.to_parquet(path)
+                except Exception as e:
+                    print(f"Warning: Failed to write {path}: {e}")
 
 if __name__ == "__main__":
     reorganize_parquet_files()
@@ -81,3 +95,4 @@ if __name__ == "__main__":
     unique_values = gather_unique_values(root_folder)
     enum_maps = create_enum_maps(unique_values)
     apply_enumeration(root_folder, enum_maps)
+    

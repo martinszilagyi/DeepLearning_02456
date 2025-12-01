@@ -2,58 +2,60 @@ import pandas as pd
 import pyarrow
 import pyarrow.parquet
 import numpy as np
-from sklearn.cluster import KMeans
-from sklearn.preprocessing import MinMaxScaler
 import os
-import shutil
-from glob import glob
-from pathlib import Path
+from tqdm import tqdm
+tqdm.pandas()
+pd.set_option('future.no_silent_downcasting', True)
 
-def resample_data(df):
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    non_numeric_cols = df.select_dtypes(exclude=[np.number]).columns
+def filter_outliers(df, distance_threshold=0.2):
+    df = df.copy()
 
-    def interpolate_group(g):
-        inserted_rows = []
-        for i in range(len(g) - 1):
-            row_current = g.iloc[i]
-            row_next = g.iloc[i + 1]
-            gap = row_next['dt']
-            if gap > 60:
-                n_intervals = int(np.ceil(gap / 60))
-                step = gap / n_intervals
+    for i in range(1, len(df)):
+        prev = df.iloc[i - 1]
+        curr = df.iloc[i]
 
-                for j in range(1, n_intervals):
-                    fraction = j / n_intervals
-                    new_row = row_current.copy()
+        dist_prev = np.hypot(
+            curr['Latitude'] - prev['Latitude'],
+            curr['Longitude'] - prev['Longitude']
+        )
 
-                    for col in numeric_cols:
-                        new_row[col] = row_current[col] + fraction * (row_next[col] - row_current[col])
+        if dist_prev > distance_threshold:
+            df.at[i, 'Latitude'] = prev['Latitude']
+            df.at[i, 'Longitude'] = prev['Longitude']
 
-                    for col in non_numeric_cols:
-                        new_row[col] = row_current[col]
+    return df
 
-                    new_row['Timestamp'] = row_current['Timestamp'] + pd.Timedelta(seconds=step * j)
-                    inserted_rows.append(new_row)
+def custom_resample(df, max_gap=60, distance_threshold=0.1):
+    df = df.copy()
+    new_rows = []
 
-        if inserted_rows:
-            g_new = pd.DataFrame(inserted_rows)
-            g_expanded = pd.concat([g, g_new], ignore_index=True)
-            g_expanded = g_expanded.sort_values(by='Timestamp').reset_index(drop=True)
-            return g_expanded
-        else:
-            return g
+    for i in range(len(df) - 1):
+        current_row = df.iloc[i]
+        next_row = df.iloc[i + 1]
 
-    # Apply per MMSI + Segment
-    df_resampled = (
-        df.groupby(['MMSI', 'Segment'], group_keys=False)
-          .apply(interpolate_group)
-          .sort_values(['MMSI', 'Segment', 'Timestamp'])
-          .reset_index(drop=True)
-    )
-    return df_resampled
+        new_rows.append(current_row)
 
-def ais_to_parque(file_path, out_path):
+        gap = next_row['dt']
+        if gap > max_gap:
+            n_missing = int(np.floor(gap / max_gap))
+            for j in range(1, n_missing + 1):
+                new_time = current_row['Timestamp'] + pd.Timedelta(seconds=max_gap * j)
+                new_row = current_row.copy()
+                new_row['Timestamp'] = new_time
+
+                for col in df.columns:
+                    if col not in ['Timestamp', 'dt']:
+                        new_row[col] = np.nan
+
+                new_rows.append(new_row)
+
+    new_rows.append(df.iloc[-1])
+    df_expanded = pd.DataFrame(new_rows)
+    df_expanded = df_expanded.sort_values('Timestamp').reset_index(drop=True)
+
+    return df_expanded
+
+def ais_to_parquet(file_path, out_path):
     dtypes = {
         "MMSI": "object",
         "SOG": float,
@@ -72,27 +74,23 @@ def ais_to_parque(file_path, out_path):
         "Draught": float
     }
     usecols = list(dtypes.keys())
+    # Read all cols raw
     df = pd.read_csv(file_path, usecols=usecols, dtype=dtypes)
 
-    # Remove errors
+    # Filter by ROI
     bbox = [60, 0, 50, 20]
     north, west, south, east = bbox
-    df = df[(df["Latitude"] <= north) & (df["Latitude"] >= south) & (df["Longitude"] >= west) & (
-            df["Longitude"] <= east)]
+    df = df[(df["Latitude"] <= north) & (df["Latitude"] >= south) & (df["Longitude"] >= west) & (df["Longitude"] <= east)]
 
+    # Filter by Type of mobile and MMSI range
     df = df[df["Type of mobile"].isin(["Class A", "Class B"])].drop(columns=["Type of mobile"])
-    df = df[df["MMSI"].str.len() == 9]  # Adhere to MMSI format
-    df = df[df["MMSI"].str[:3].astype(int).between(200, 775)]  # Adhere to MID standard
+    df = df[df["MMSI"].str.len() == 9]
+    df = df[df["MMSI"].str[:3].astype(int).between(200, 775)]
 
+    # Rename and convert Timestamp
     df = df.rename(columns={"# Timestamp": "Timestamp"})
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
-
-    df = df.drop_duplicates(["Timestamp", "MMSI"], keep="first")
-
-    # Group by MMSI and Segment, then fill NaNs for dynamic features using ffill
-    # NaN values for features like SOG, COG, ROT, Heading, Draught, Width, Length 
-    # should be filled with the last known value within the track segment.
-    imputation_cols = ["Latitude", "Longitude", "SOG", "COG", "ROT", "Heading"]
+    df = df.drop_duplicates(["Timestamp", "MMSI", ], keep="first")
 
     def track_filter(g):
         len_filt = len(g) > 256  # Min required length of track/segment
@@ -100,244 +98,90 @@ def ais_to_parque(file_path, out_path):
         time_filt = (g["Timestamp"].max() - g["Timestamp"].min()).total_seconds() >= 60 * 60  # Min required timespan
         return len_filt and sog_filt and time_filt
 
-    # Track filtering
+    # Keep only vessel tracks (grouped by MMSI) that are long enough, span at least 1 hour,
+    # and have realistic speeds, using the custom track_filter() criteria
     df = df.groupby("MMSI").filter(track_filter)
     df = df.sort_values(['MMSI', 'Timestamp'])
 
-    # Divide track into segments based on timegap
-    df['Segment'] = df.groupby('MMSI')['Timestamp'].transform(
-        lambda x: (x.diff().dt.total_seconds().fillna(0) >= 15 * 60).cumsum())  # Max allowed timegap
+    # Split segments by 10-minute gap (600 seconds)
+    df['Segment'] = df.groupby('MMSI')['Timestamp'].transform(lambda x: (x.diff().dt.total_seconds().fillna(0) >= 15 * 60).cumsum())
 
-    #
+    #convert SOG from knots to m/s
     knots_to_ms = 0.514444
     df["SOG"] = knots_to_ms * df["SOG"]
 
-    # Segment filtering
+    # Apply track_filter again on segments
     df = df.groupby(["MMSI", "Segment"]).filter(track_filter)
     df = df.reset_index(drop=True)
 
-    # Calculate Time Difference (dt) in seconds
+    # Calculate time differences
     df['dt'] = df.groupby(['MMSI', 'Segment'])['Timestamp'].diff().dt.total_seconds().fillna(0)
-    num_mmsi = df["MMSI"].nunique()
-    print(f"Unique MMSIs: {num_mmsi}")
-    df = resample_data(df)
 
+    results = []
+
+    # Resample each segment to have one sample per minute
+    for (mmsi, segment), group_df in tqdm(df.groupby(['MMSI', 'Segment']), total=df.groupby(['MMSI', 'Segment']).ngroups):
+        group_df = group_df.sort_values('Timestamp').reset_index(drop=True)
+        numeric_cols = group_df.select_dtypes(include=[np.number]).columns
+        non_numeric_cols = group_df.select_dtypes(exclude=[np.number]).columns
+
+        g_resampled = filter_outliers(group_df, distance_threshold=0.1)
+        g_resampled = custom_resample(g_resampled)
+        g_resampled[numeric_cols] = g_resampled[numeric_cols].interpolate(method='linear', limit_direction='both')
+        g_resampled[non_numeric_cols] = g_resampled[non_numeric_cols].ffill().bfill()
+
+        g_resampled['MMSI'] = mmsi
+        g_resampled['Segment'] = segment
+        results.append(g_resampled)
+
+    df_resampled = pd.concat(results, ignore_index=True)
+
+    # Impute remaining NaNs in specific columns
+    imputation_cols = ["SOG", "COG", "ROT", "Heading"]
     for col in imputation_cols:
-        # Replace zeros with NaN so they can be interpolated
-        df[col] = df[col].replace(0, np.nan)
-        
-        # Interpolate per group
-        df[col] = df.groupby(['MMSI', 'Segment'])[col].transform(
-            lambda x: x.interpolate().ffill().bfill()
-        )
-        
-        # Replace any remaining NaNs with 0
-        df[col] = df[col].fillna(0)
+        df_resampled[col] = df_resampled.groupby(['MMSI', 'Segment'])[col].transform(lambda x: x.interpolate().ffill().bfill())
+        df_resampled[col] = df_resampled[col].fillna(0)
 
-    df["Minute"] = df["Timestamp"].dt.floor("min")          # Keep one measurement from each minute
-    df = df.drop_duplicates(subset=["Minute", "MMSI"], keep="first")
-    df = df.drop(columns=["Minute"])
+    latlon_cols = ["Latitude", "Longitude"]
+    for col in latlon_cols:
+        df_resampled[col] = df_resampled.groupby(['MMSI', 'Segment'])[col].transform(lambda x: x.ffill().bfill())
 
-    # recalculate the delta time <- ensure it's < 60
-    df = df.drop(columns=["dt"])
-    df['dt'] = df.groupby(['MMSI', 'Segment'])['Timestamp'].diff().dt.total_seconds().fillna(0)
+    # Remove duplicates within the same minute
+    df_resampled["Minute"] = df_resampled["Timestamp"].dt.floor("min")
+    df_resampled = df_resampled.drop_duplicates(subset=["Minute", "MMSI"], keep="first")
+    df_resampled = df_resampled.drop(columns=["Minute"])
 
-    # Velocity Components (Requires SOG in m/s)
-    # Note: COG is usually 0-360 degrees. Convert to radians for sin/cos.
-    df['COG_rad'] = np.deg2rad(df['COG'])
-    df['Velocity_N'] = df['SOG'] * np.cos(df['COG_rad']) # North component (Latitude direction)
-    df['Velocity_E'] = df['SOG'] * np.sin(df['COG_rad']) # East component (Longitude direction)
-    df.drop(columns=['COG_rad'], inplace=True)
+    # Final feature engineering
+    df_resampled = df_resampled.drop(columns=["dt"])
+    df_resampled['dt'] = df_resampled.groupby(['MMSI', 'Segment'])['Timestamp'].diff().dt.total_seconds().fillna(0)
+    df_resampled['COG_rad'] = np.deg2rad(df_resampled['COG'])
+    df_resampled['sin_cog'] = np.sin(df_resampled['COG_rad'])
+    df_resampled['cos_cog'] = np.cos(df_resampled['COG_rad'])
+    df_resampled = df_resampled.drop(columns=['COG_rad', 'COG'])
 
-    df = merge_stationary_into_df(df)
-    table = pyarrow.Table.from_pandas(df, preserve_index=False)
+    # Write to parquet files
+    #df_resampled["Timestamp"] = df_resampled["Timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S") #FOR DEBUG ONLY!!!
+    table = pyarrow.Table.from_pandas(df_resampled, preserve_index=False)
     pyarrow.parquet.write_to_dataset(
         table,
         root_path=out_path,
-        partition_cols=["MMSI",  # "Date",
-                        "Segment",  # "Geocell"
-                        ]
+        partition_cols=["MMSI", "Segment"]
     )
 
-def extract_stationary_data(file_path):
-    stationary_cols = ["Ship type", "Cargo type", "Width", "Length", "Draught"]
-    parquet_files = glob(os.path.join(file_path, "**", "*.parquet"), recursive=True)
-
-    if not parquet_files:
-        print("No parquet files found.")
-        return
-
-    for file in parquet_files:
-        #print(f"Processing: {file}")
-        try:
-            df = pd.read_parquet(file)
-        except Exception as e:
-            print(f"Failed to read {file}: {e}")
-            continue
-
-        ship_info = {}
-        for col in stationary_cols:
-            if col in df.columns:
-                valid_values = df[col][
-                    (df[col].notnull()) &
-                    (df[col] != 0) &
-                    (df[col].astype(str).str.lower() != "undefined")
-                ]
-                ship_info[col] = valid_values.iloc[0] if not valid_values.empty else None
-            else:
-                ship_info[col] = 0
-
-        stationary_df = pd.DataFrame([ship_info])
-        stationary_file = os.path.splitext(file)[0] + "_stationary.parquet"
-
-        try:
-            stationary_df.to_parquet(stationary_file, index=False)
-           # print(f"Written: {stationary_file}")
-        except Exception as e:
-            print(f"Error writing {stationary_file}: {e}")
-            continue
-
-        df = df.drop(columns=[c for c in stationary_cols if c in df.columns], errors="ignore")
-        try:
-            df.to_parquet(file, index=False)
-        except Exception as e:
-            print(f"Error overwriting {file}: {e}")
-
-def delete_stationary_data(file_path):
-    deleted_count = 0
-
-    # Use glob to find matching files recursively
-    pattern = os.path.join(file_path, '**', '*stationary*.parquet')
-    for parquet_file in glob(pattern, recursive=True):
-        os.remove(parquet_file)
-        deleted_count += 1
-
-    print(f"\nTotal files deleted: {deleted_count}")
-
-def reorganize_parquet_pairs(root_path):
-    root_path = Path(root_path)
-
-    for mmsi_folder in root_path.glob("MMSI=*"):
-        if not mmsi_folder.is_dir():
-            continue
-        
-        print(f"Processing {mmsi_folder.name}...")
-        
-        # Collect all parquet files under this MMSI folder (recursively)
-        parquet_files = list(mmsi_folder.rglob("*.parquet"))
-        
-        # Build a dict of base name -> both files (normal + stationary)
-        file_pairs = {}
-        for pf in parquet_files:
-            name = pf.stem.replace("_stationary", "")
-            file_pairs.setdefault(name, []).append(pf)
-        
-        # Create new Segment folders for each pair
-        for i, (basename, files) in enumerate(sorted(file_pairs.items()), start=1):
-            segment_folder = mmsi_folder / f"Segment={i}"
-            segment_folder.mkdir(exist_ok=True)
-            
-            for f in files:
-                dest = segment_folder / f.name
-                # Move the file to the new segment folder
-                shutil.move(str(f), dest)
-        
-        # Clean up: remove old segment folders if they’re empty
-        for old_segment in mmsi_folder.glob("Segment=*"):
-            if not any(old_segment.iterdir()):
-                old_segment.rmdir()
-
-def get_folder_size(path):
-    path = Path(path)
-    total = sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
-    print(f"Size: {total / (1024 ** 2):.2f} MB")
-
-def merge_stationary_into_df(df):
-    """
-    Extract stationary ship properties for each MMSI and
-    merge them back into the original dataframe.
-    """
-
-    stationary_cols = ["Ship type", "Cargo type", "Width", "Length", "Draught"]
-
-    out = []
-
-    # Process one MMSI at a time
-    for mmsi, g in df.groupby("MMSI"):
-        ship_info = {}
-
-        for col in stationary_cols:
-            if col not in g.columns:
-                ship_info[col] = None
-                continue
-
-            valid = g[col][
-                g[col].notnull() &
-                (g[col] != 0) &
-                (g[col].astype(str).str.lower() != "undefined")
-            ]
-
-            ship_info[col] = valid.iloc[0] if not valid.empty else None
-
-        # Convert to dataframe
-        stat_df = pd.DataFrame([ship_info])
-        stat_df["MMSI"] = mmsi
-
-        out.append(stat_df)
-
-    # Combine stationary table
-    stationary_table = pd.concat(out, ignore_index=True)
-
-    # Merge back into original
-    df = df.drop(columns=stationary_cols, errors="ignore")
-    df = df.merge(stationary_table, on="MMSI", how="left")
-
-    return df
-
-def count_parquet_pairs(root_path):
-    root_path = Path(root_path)
-    total_pairs = 0
-    details = {}
-
-    for mmsi_folder in root_path.glob("MMSI=*"):
-        if not mmsi_folder.is_dir():
-            continue
-        
-        # Find all parquet files under this MMSI folder (recursively)
-        parquet_files = list(mmsi_folder.rglob("*.parquet"))
-        
-        # Group by base name (ignoring _stationary)
-        file_pairs = {}
-        for f in parquet_files:
-            base = f.stem.replace("_stationary", "")
-            file_pairs.setdefault(base, []).append(f)
-        
-        # Count valid pairs (both normal + stationary exist)
-        pair_count = sum(1 for files in file_pairs.values() if len(files) == 2)
-        total_pairs += pair_count
-        details[mmsi_folder.name] = pair_count
-
-    print("Pair count by MMSI folder:")
-    for k, v in details.items():
-        print(f"  {k}: {v} pairs")
-
-    print(f"\nTotal parquet pairs across all MMSI folders: {total_pairs}")
-    return total_pairs
+    print(f"Converted {os.path.basename(file_path)} to Parquet format.")
 
 if __name__ == "__main__":
     ais_folder_path = os.path.join(os.path.dirname(__file__), '../csvs/')
+    print(f"Processing AIS CSV files from {ais_folder_path}")
     parquet_folder_path = os.path.join(ais_folder_path, 'parquets/')
+    print(f"Saving Parquet files to {parquet_folder_path}")
     os.makedirs(parquet_folder_path, exist_ok=True)
 
     for filename in os.listdir(ais_folder_path):
+        print(f"Found file: {filename}")
         if filename.endswith('.csv'):
             file_path = os.path.join(ais_folder_path, filename)
-            ais_to_parque(file_path, parquet_folder_path)
+            ais_to_parquet(file_path, parquet_folder_path)
 
-    print("Parqueting done")
-    #delete_stationary_data(parquet_folder_path)
-    #extract_stationary_data(parquet_folder_path)
-
-    #reorganize_parquet_pairs(parquet_folder_path)
-
-    #test MMSI=538009531
+    print("Parquet files created successfully")
+# 636092635
