@@ -1,0 +1,9 @@
+#BSUB -J ais_to_parquet
+#BSUB -o ais_to_parquet_%J.out
+#BSUB -q gpua40
+#BSUB -n 4
+#BSUB -R "rusage[mem=4GB]"
+#BSUB -gpu "num=1:mode=exclusive_process"
+#BSUB -W 24:00
+
+python ./src/ais_to_parquet.py
