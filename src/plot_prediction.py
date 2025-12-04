@@ -39,17 +39,10 @@ def denormalize_coords(coord_list):
 
 # Visualize sequences on a folium map
 def visualize_sequences(json_filepath, output_html="sequences_map.html"):
-    global lat_mean, lat_std, lon_mean, lon_std
 
     # Open the JSON file and read data
     with open(json_filepath, "r") as f:
         data = json.load(f)
-    
-    # Get normalization parameters
-    lat_mean = data["columns"]["Latitude"]["mean"]
-    lat_std  = data["columns"]["Latitude"]["std"]
-    lon_mean = data["columns"]["Longitude"]["mean"]
-    lon_std  = data["columns"]["Longitude"]["std"]
     
     # Collect all coords for map centering
     all_coords = []
@@ -94,6 +87,16 @@ def visualize_sequences(json_filepath, output_html="sequences_map.html"):
 
 # Main execution
 if __name__ == "__main__":
+    #open normalization info file
+    with open(os.path.join(os.getcwd(), "./data/normalization_info.json"), "r") as f:
+        data = json.load(f)
+
+    # Get normalization parameters
+    lat_mean = data["columns"]["Latitude"]["mean"]
+    lat_std  = data["columns"]["Latitude"]["std"]
+    lon_mean = data["columns"]["Longitude"]["mean"]
+    lon_std  = data["columns"]["Longitude"]["std"]
+
     # Call the visualization function
     visualize_sequences(
         os.path.join(os.getcwd(), "test_predictions" + postifx + ".json"),
