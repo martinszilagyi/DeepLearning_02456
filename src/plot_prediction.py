@@ -1,76 +1,92 @@
 import json
 import folium
 import os
+import argparse
 
-# Constants for scaling
-LAT_MIN, LAT_MAX = 51.1395, 59.307808
-LON_MIN, LON_MAX = 0.0002, 19.6405
+# Argument parser for bsub flag (for jobs on cluster)
+parser = argparse.ArgumentParser()
+parser.add_argument("--isbsub", action="store_true")
+args = parser.parse_args()
 
+postifx = "_bsub" if args.isbsub else ""
+
+# Z normalization parameters initialization
+lat_mean = 0.0
+lat_std = 0.0
+lon_mean = 0.0
+lon_std = 0.0
+
+# Denormalize latitude
 def denormalize_lat(lat_norm):
-    return LAT_MIN + lat_norm * (LAT_MAX - LAT_MIN)
+    return lat_norm * lat_std + lat_mean
 
+# Denormalize longitude
 def denormalize_lon(lon_norm):
-    return LON_MIN + lon_norm * (LON_MAX - LON_MIN)
+    return lon_norm * lon_std + lon_mean
 
+# Denormalize list of coordinates
 def denormalize_coords(coord_list):
     return [(denormalize_lat(p["lat"]), denormalize_lon(p["lon"])) for p in coord_list]
 
+# Visualize sequences on a folium map
 def visualize_sequences(json_filepath, output_html="sequences_map.html"):
-    # Load JSON data
+    global lat_mean, lat_std, lon_mean, lon_std
+
+    # Open the JSON file and read data
     with open(json_filepath, "r") as f:
         data = json.load(f)
     
-    # Compute overall average location for initial map center
+    # Get normalization parameters
+    lat_mean = data["columns"]["Latitude"]["mean"]
+    lat_std  = data["columns"]["Latitude"]["std"]
+    lon_mean = data["columns"]["Longitude"]["mean"]
+    lon_std  = data["columns"]["Longitude"]["std"]
+    
+    # Collect all coords for map centering
     all_coords = []
     for seq in data:
-        all_coords.extend(denormalize_coords(seq["known_path"]))     # include known_path here for centering
+        all_coords.extend(denormalize_coords(seq["known_path"]))
         all_coords.extend(denormalize_coords(seq["ground_truth"]))
         all_coords.extend(denormalize_coords(seq["prediction"]))
+
+    # Center map around average location
     avg_lat = sum(lat for lat, lon in all_coords) / len(all_coords)
     avg_lon = sum(lon for lat, lon in all_coords) / len(all_coords)
-    
-    # Create folium map centered at average location
+
+    # Create folium map
     m = folium.Map(location=[avg_lat, avg_lon], zoom_start=6)
-    
+
     # Plot each sequence
     for seq in data:
         seq_id = seq.get("sequence_id", "N/A")
         
-        # Denormalize points
         known_coords = denormalize_coords(seq["known_path"])
         gt_coords = denormalize_coords(seq["ground_truth"])
         pred_coords = denormalize_coords(seq["prediction"])
-        
-        # Add known path polyline (blue)
+
         folium.PolyLine(
-            known_coords,
-            color="blue",
-            weight=3,
-            opacity=0.7,
+            known_coords, color="blue", weight=3, opacity=0.7,
             tooltip=f"Sequence {seq_id} Known Path"
         ).add_to(m)
-        
-        # Add ground truth polyline (green)
+
         folium.PolyLine(
-            gt_coords,
-            color="green",
-            weight=3,
-            opacity=0.7,
+            gt_coords, color="green", weight=3, opacity=0.7,
             tooltip=f"Sequence {seq_id} Ground Truth"
         ).add_to(m)
-        
-        # Add prediction polyline (red)
+
         folium.PolyLine(
-            pred_coords,
-            color="red",
-            weight=3,
-            opacity=0.7,
+            pred_coords, color="red", weight=3, opacity=0.7,
             tooltip=f"Sequence {seq_id} Prediction"
         ).add_to(m)
-    
-    # Save the map
+
+    # Save map to HTML
     m.save(output_html)
     print(f"Map saved to {output_html}")
 
-# Example usage:
-visualize_sequences(os.path.join(os.getcwd(), "test_predictions.json"), "sequences_map.html")
+# Main execution
+if __name__ == "__main__":
+    # Call the visualization function
+    visualize_sequences(
+        os.path.join(os.getcwd(), "test_predictions" + postifx + ".json"),
+        "sequences_map" + postifx + ".html"
+    )

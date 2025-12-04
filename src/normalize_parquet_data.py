@@ -55,7 +55,7 @@ def compute_global_stats(parquet_files):
             lon_min = min(lon_min, df['Longitude'].min())
             lon_max = max(lon_max, df['Longitude'].max())
         except Exception as e:
-            print(f"⚠️ Skipping {file} (error: {e})")
+            print(f"Skipping {file} (error: {e})")
 
     lat0 = (lat_min + lat_max) / 2
     lon0 = (lon_min + lon_max) / 2
@@ -92,7 +92,7 @@ def compute_global_stats(parquet_files):
                 counts[col] = counts.get(col, 0) + ccount
 
         except Exception as e:
-            print(f"⚠️ Skipping {file} (error: {e})")
+            print(f"Skipping {file} (error: {e})")
 
     means = {}
     stds = {}
@@ -142,7 +142,7 @@ def normalize_parquet_files(parquet_files, means, stds, lat0, lon0):
                     # Check for non-numeric before coercion
                     non_numeric = df[col].apply(lambda x: not pd.api.types.is_number(x)).sum()
                     if non_numeric > 0:
-                        print(f"⚠️ Column {col} in file {file} has {non_numeric} non-numeric entries, coercing to NaN.")
+                        print(f"Column {col} in file {file} has {non_numeric} non-numeric entries, coercing to NaN.")
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                     df[col] = df[col].fillna(means[col])
                     std_val = stds[col] if stds[col] > 0 else 1.0
@@ -152,7 +152,7 @@ def normalize_parquet_files(parquet_files, means, stds, lat0, lon0):
 
             df.to_parquet(file, index=False)
         except Exception as e:
-            print(f"⚠️ Failed to normalize {file}: {e}")
+            print(f"Failed to normalize {file}: {e}")
 
 def main():
     parquet_files = get_all_parquet_files(ROOT_DIR)
@@ -179,8 +179,8 @@ def main():
     with open(OUTPUT_INFO_FILE, "w") as f:
         json.dump(normalization_info, f, indent=4)
 
-    print("\n✅ Z-score normalization and feature augmentation completed successfully.")
-    print(f"📄 Info saved at: {OUTPUT_INFO_FILE}")
+    print("\nZ-score normalization and feature augmentation completed successfully.")
+    print(f"Info saved at: {OUTPUT_INFO_FILE}")
 
 if __name__ == "__main__":
     main()

@@ -1,44 +1,127 @@
-import duckdb
-import pandas as pd
-import folium
 import os
+import random
+import argparse
+import folium
+import pyarrow.parquet as pq
+import pandas as pd
+import webbrowser
+import numpy as np
 
-folder_path = os.path.join(os.path.dirname(__file__), '../data/parquets/')
-filename = 'MMSI=205243000/Segment=0/d7660b18593746e1b773307daba2758b-0.parquet'
-file_path = '/zhome/fe/e/213609/DeepLearning/data/csvs/parquets/MMSI=210231000/Segment=3/b5d3cf8375d54e3fbef6e102d5c6213a-0.parquet'
+def extract_mmsi_from_path(path):
+    parts = path.replace("\\", "/").split("/")
+    for p in parts:
+        if p.startswith("MMSI="):
+            return p.split("=", 1)[1]
+    return "Unknown"
 
-# Load parquet robustly using DuckDB
-df = duckdb.query(f"SELECT * FROM read_parquet('{file_path}')").to_df()
+def plot_random_paths(parquet_dir, output_html, num_paths=50):
+    parquet_files = []
+    for root, _, files in os.walk(parquet_dir):
+        for f in files:
+            if f.lower().endswith('.parquet'):
+                parquet_files.append(os.path.join(root, f))
 
-print("Columns:", df.columns)
-print(df.head())
+    if not parquet_files:
+        print(f"No parquet files found in {parquet_dir}")
+        return
 
-# Ensure latitude and longitude columns exist and are numeric
-df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
-df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
-df = df.dropna(subset=['Latitude', 'Longitude'])
+    selected_files = random.sample(parquet_files, min(num_paths, len(parquet_files)))
 
-# Denormalization constants
-lat_min, lat_max = 51.271528, 59.307808
-lon_min, lon_max = 0.0002, 18.4068
+    # Read first file to determine map center
+    table = pq.read_table(selected_files[0])
+    df_first = table.to_pandas()
 
-# Denormalize Latitude and Longitude
-df['Latitude_original'] = df['Latitude'] * (lat_max - lat_min) + lat_min
-df['Longitude_original'] = df['Longitude'] * (lon_max - lon_min) + lon_min
+    # Convert Latitude/Longitude to float just in case
+    df_first['Latitude'] = pd.to_numeric(df_first['Latitude'], errors='coerce')
+    df_first['Longitude'] = pd.to_numeric(df_first['Longitude'], errors='coerce')
 
-# Create map centered on mean of denormalized lat/lon
-center = [df['Latitude_original'].mean(), df['Longitude_original'].mean()]
-m = folium.Map(location=center, zoom_start=6)
+    df_first = df_first.dropna(subset=['Latitude', 'Longitude'])
+    center_lat = df_first['Latitude'].mean()
+    center_lon = df_first['Longitude'].mean()
 
-# Plot all points with original lat/lon
-for _, row in df.iterrows():
-    folium.CircleMarker(
-        location=[row['Latitude_original'], row['Longitude_original']],
-        radius=2,
-        color='blue',
-        fill=True,
-        fill_opacity=0.6
-    ).add_to(m)
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=10)
 
-# Save map
-m.save("map.html")
+    colors = [
+        'blue', 'red', 'green', 'purple', 'orange', 'darkred', 'lightred', 'beige',
+        'darkblue', 'darkgreen', 'cadetblue', 'darkpurple', 'white', 'pink',
+        'lightblue', 'lightgreen', 'gray', 'black', 'lightgray'
+    ]
+
+    for i, file in enumerate(selected_files):
+        try:
+            mmsi = extract_mmsi_from_path(file)
+
+            table = pq.read_table(file)
+            df = table.to_pandas()
+
+            # Convert coords to float and drop invalid rows
+            df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
+            df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
+            df = df.dropna(subset=['Latitude', 'Longitude'])
+
+            # Sort by Timestamp if exists, otherwise skip
+            if 'Timestamp' in df.columns:
+                df['Timestamp'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+                df = df.dropna(subset=['Timestamp'])
+                df = df.sort_values('Timestamp')
+
+            coords = list(zip(df['Latitude'], df['Longitude']))
+
+            # Skip if less than 2 unique points
+            if len(coords) < 2:
+                continue
+            if len(set(coords)) < 2:
+                continue
+
+            color = colors[i % len(colors)]
+
+            folium.PolyLine(
+                coords,
+                color=color,
+                weight=3,
+                opacity=0.8,
+                tooltip=f"MMSI: {mmsi}"
+            ).add_to(m)
+
+            # Start marker
+            folium.CircleMarker(
+                coords[0],
+                radius=5,
+                color=color,
+                fill=True,
+                fill_opacity=0.9,
+                tooltip=f"Start – MMSI {mmsi}"
+            ).add_to(m)
+
+            # End marker
+            folium.CircleMarker(
+                coords[-1],
+                radius=5,
+                color=color,
+                fill=True,
+                fill_opacity=0.9,
+                tooltip=f"End – MMSI {mmsi}"
+            ).add_to(m)
+
+        except Exception as e:
+            print(f"Skipping {file} due to error: {e}")
+
+    m.save(output_html)
+    webbrowser.open(f'file://{os.path.realpath(output_html)}')
+    print(f"Map saved to {output_html}")
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize random vessel paths from parquet files.")
+    parser.add_argument("parquet_dir", help="Directory containing parquet files")
+    parser.add_argument("--output", default="random_paths_map.html", help="Output HTML file name")
+    parser.add_argument("--num", type=int, default=50, help="Number of random paths to plot")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.parquet_dir):
+        print(f"Directory not found: {args.parquet_dir}")
+        return
+
+    plot_random_paths(args.parquet_dir, args.output, args.num)
+
+if __name__ == "__main__":
+    main()
