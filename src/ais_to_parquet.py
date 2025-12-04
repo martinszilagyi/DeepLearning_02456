@@ -1,3 +1,11 @@
+"""
+This file contains functions to process AIS CSV files and convert them to Parquet format.
+It includes filtering, resampling, interpolation, and feature engineering steps.
+This is the first step in the data preprocessing pipeline.
+Input: Raw AIS CSV files
+Output: Processed AIS Parquet files partitioned by MMSI and Segment
+"""
+
 import pandas as pd
 import pyarrow
 import pyarrow.parquet

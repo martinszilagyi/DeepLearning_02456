@@ -1,3 +1,12 @@
+"""
+This script visualizes ship trajectory predictions on a folium map. It reads
+a JSON file containing known paths, ground truth, and predicted paths. For the plotting the data is denormalized using
+provided Z normalization parameters. The resulting map is saved as an HTML file.
+- Blue paths represent the known trajectories from which the predictions were made.
+- Red paths represent the predicted trajectories.
+- Green paths represent the ground truth trajectories for comparison.
+"""
+
 import json
 import folium
 import os

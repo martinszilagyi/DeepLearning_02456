@@ -1,3 +1,8 @@
+"""
+This script reads training and validation loss pairs from a JSON file and
+plots them using matplotlib. The resulting plot is saved as a PNG image.
+"""
+
 from matplotlib import pyplot as plt
 import json
 import argparse

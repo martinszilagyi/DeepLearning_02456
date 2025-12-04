@@ -1,3 +1,9 @@
+"""
+This script implements a sequence-to-sequence model with attention mechanism
+for ship trajectory prediction using PyTorch. It includes data loading,
+preprocessing, model definition, training with early stopping, and evaluation.
+"""
+
 import os
 import glob
 import pandas as pd

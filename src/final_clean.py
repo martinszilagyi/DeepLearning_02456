@@ -1,3 +1,10 @@
+"""
+This script reorganizes Parquet files into segment folders and applies enumeration mappings to non-numeric columns.
+This is the final step in the data preprocessing pipeline.
+Input: Normalized AIS Parquet files with additional features
+Output: Normalized AIS Parquet files with enumeration mappings organized such that each MMSI has different segment folders for each path
+"""
+
 import os
 import shutil
 import pandas as pd

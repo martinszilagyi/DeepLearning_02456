@@ -1,3 +1,11 @@
+"""
+This file contains functions to normalize AIS Parquet files by applying z-score normalization globally across all files.
+It also adds new features such as latitude/longitude in meters, velocity, and acceleration.
+This is the second step in the data preprocessing pipeline.
+Input: Processed AIS Parquet files partitioned by MMSI and Segment
+Output: Normalized AIS Parquet files with additional features
+"""
+
 import os
 import json
 import pandas as pd

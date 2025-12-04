@@ -1,3 +1,9 @@
+"""
+This script visualizes random vessel paths from parquet files in a specified directory.
+It uses Folium to create an interactive map with plotted paths, start and end markers,
+and saves the output as an HTML file which is then opened in the default web browser.
+"""
+
 import os
 import random
 import argparse
