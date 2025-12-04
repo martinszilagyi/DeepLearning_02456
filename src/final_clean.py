@@ -2,9 +2,11 @@ import os
 import shutil
 import pandas as pd
 
+# Reorganize Parquet Files into Segment Folders (Because more paths can be added to the same MMSI/Segment folder by previous steps)
 def reorganize_parquet_files():
     root_folder = os.path.join(os.getcwd(), "csvs", "parquets")
 
+    # Iterate over each MMSI folder
     for mmsi_folder in os.listdir(root_folder):
         mmsi_path = os.path.join(root_folder, mmsi_folder)
         if not os.path.isdir(mmsi_path):
@@ -40,6 +42,7 @@ def reorganize_parquet_files():
 
     print("Reorganization complete.")
 
+# Gather unique non-numeric values from all Parquet files (to create enumeration mappings)
 def gather_unique_values(root_folder):
     unique_values = {}
     for dirpath, _, filenames in os.walk(root_folder):
@@ -53,6 +56,7 @@ def gather_unique_values(root_folder):
                     continue
                 if 'Timestamp' in df.columns:
                     df = df.drop(columns=['Timestamp'])
+                # Collect unique non-numeric values
                 non_numeric_cols = df.select_dtypes(exclude='number').columns
                 for col in non_numeric_cols:
                     if col not in unique_values:
@@ -60,13 +64,15 @@ def gather_unique_values(root_folder):
                     unique_values[col].update(df[col].dropna().unique())
     return unique_values
 
+# Create enumeration mappings for each non-numeric column
 def create_enum_maps(unique_values):
     enum_maps = {}
     for col, values in unique_values.items():
-        sorted_values = sorted(values)  # optional: sort for consistency
+        sorted_values = sorted(values)
         enum_maps[col] = {v: i for i, v in enumerate(sorted_values)}
     return enum_maps
 
+# Apply enumeration mappings to all Parquet files (in new cols)
 def apply_enumeration(root_folder, enum_maps):
     for dirpath, _, filenames in os.walk(root_folder):
         for file in filenames:
@@ -81,7 +87,7 @@ def apply_enumeration(root_folder, enum_maps):
                     df = df.drop(columns=['Timestamp'])
                 for col, mapping in enum_maps.items():
                     if col in df.columns:
-                        df[f'{col}_enum'] = df[col].map(mapping).fillna(-1).astype(int)  # -1 for unknowns
+                        df[f'{col}_enum'] = df[col].map(mapping).fillna(-1).astype(int)
                         orig = df.pop(col)
                         df[col] = orig
                 try:
@@ -89,6 +95,7 @@ def apply_enumeration(root_folder, enum_maps):
                 except Exception as e:
                     print(f"Warning: Failed to write {path}: {e}")
 
+# Main execution
 if __name__ == "__main__":
     reorganize_parquet_files()
     root_folder = os.path.join(os.getcwd(), "csvs", "parquets")
