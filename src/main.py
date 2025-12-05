@@ -15,6 +15,8 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 import json
 import argparse
+import sys
+import select
 
 # Use only a few path for quick testing
 USE_ONE_PATH = False
@@ -26,6 +28,7 @@ parser.add_argument("--isbsub", action="store_true")
 args = parser.parse_args()
 if args.isbsub:
     postifx = "_bsub"
+    USE_ONE_PATH = False
 else:
     postifx = ""
 
@@ -63,7 +66,7 @@ class Seq2SeqDeltaModelAutoregressive(nn.Module):
                  num_of_nav_status=10,
                  encoder_hidden_size=128,
                  attn_dim = 64,
-                 output_size=2,  # output size changed to 2 (no heading)
+                 output_size=2,
                  forecast_steps=60):
         super().__init__()
 
@@ -92,7 +95,7 @@ class Seq2SeqDeltaModelAutoregressive(nn.Module):
         # Attention mechanism
         self.attention = BahdanauAttention(encoder_hidden_size, encoder_hidden_size, attn_dim)
 
-        # Decoder LSTM (autoregresszív)
+        # Decoder LSTM (autoregressive)
         self.decoder_lstm = nn.LSTM(
             input_size=output_size + encoder_hidden_size,  # 2 + 256
             hidden_size=encoder_hidden_size,
@@ -103,7 +106,7 @@ class Seq2SeqDeltaModelAutoregressive(nn.Module):
         # Linear output layer
         self.fc_out = nn.Linear(encoder_hidden_size, output_size)
 
-    def forward(self, x_dynamic, x_emb_nav_status, ground_truth, p=0.5):
+    def forward(self, x_dynamic, x_emb_nav_status, ground_truth, tf=0.5):
         # Fetch last known position
         last_known_pos = x_dynamic[:, -1, :2]
 
@@ -138,8 +141,12 @@ class Seq2SeqDeltaModelAutoregressive(nn.Module):
         decoder_hidden = (h.contiguous(), c.contiguous())
         pos = last_known_pos
         abs_outputs = []
+        delta_outputs = []
         # Starting input is the last known position
         decoder_input = pos.unsqueeze(1)
+
+        # Teacher forcing decay rate
+        tf_decay_rate = tf / (self.forecast_steps + 200)
 
         # Autoregressive decoding loop
         for t in range(self.forecast_steps):
@@ -155,21 +162,32 @@ class Seq2SeqDeltaModelAutoregressive(nn.Module):
             # Predicted delta
             pred_delta = self.fc_out(hidden_vec)
 
-            # Update position
-            pos = pos + pred_delta
-            abs_outputs.append(pos)
-
-            # Scheduled sampling
-            if torch.rand(1).item() < p:
-                # Use model's own prediction
-                decoder_input = pos.unsqueeze(1)
+            # Update position (Anchor first point to last known position)
+            if t == 0:
+                pos = pos
             else:
-                # Ground truth last known pos
-                decoder_input = ground_truth[:, t].unsqueeze(1)
+                pos = pos + pred_delta
+            abs_outputs.append(pos)
+            delta_outputs.append(pred_delta)
+
+           # Scheduled sampling: choose whether to use ground truth or prediction
+            if torch.rand(1).item() < tf:
+                # Teacher forcing: use ground truth delta
+                if t == 0:
+                    gt_delta_pos = ground_truth[:, 0, :2] - last_known_pos
+                else:
+                    gt_delta_pos = ground_truth[:, t, :2] - ground_truth[:, t-1, :2]
+                decoder_input = gt_delta_pos.unsqueeze(1)
+            else:
+                # Use model prediction as next input
+                decoder_input = pred_delta.unsqueeze(1)
+
+            # Decay teacher forcing probability
+            tf = max(0.0, tf - tf_decay_rate)
 
         # Final output tensor
         abs_outputs = torch.stack(abs_outputs, dim=1)
-        return abs_outputs
+        return abs_outputs, delta_outputs
 
 # Trajectory dataset type
 class TrajectoryDataset(Dataset):
@@ -185,10 +203,10 @@ class TrajectoryDataset(Dataset):
         dynamic_cols = ['Latitude', 'Longitude', 'SOG', 'cos_cog', 'sin_cog', 'vx', 'vy', 'Heading']
         nav_status_col = 'Navigational status_enum'
 
-        # Fixed split index for 360-length sequences (6 hours of data)
-        # We crop all sequences to 360 length during data loading and slice them into fixed parts
-        # 5 hours known (300 points), 1 hour forecast (60 points)
-        split_idx = 300
+        # Fixed split index for 240-length sequences (4 hours of data)
+        # We crop all sequences to 240 length during data loading and slice them into fixed parts
+        # 3 hours known (180 points), 1 hour forecast (60 points)
+        split_idx = 180
 
         # Dynamic features + navigational status embedding
         x_dynamic = df.loc[:split_idx-1, dynamic_cols].to_numpy(dtype='float32')
@@ -263,19 +281,23 @@ def train_loop(model, dataloader, optimizer, criterion, device):
         optimizer.zero_grad()
 
         # Try model forward pass
-        y_pred_abs = model(x_dynamic, x_emb_nav_status, y_abs, 0.5)
+        y_pred_abs, y_pred_delta = model(x_dynamic, x_emb_nav_status, y_abs, tf=0.7)
 
         # Ensure y_abs is float
         y_abs = y_abs.float()
+        y_pred_delta = [d.float() for d in y_pred_delta]
+        delta_y_abs = y_abs[:, 1:, :2] - y_abs[:, :-1, :2]
 
-        # Compute loss
+        # Compute loss (pos + deltas)
         loss = criterion(y_pred_abs, y_abs)
+        for t, d in enumerate(y_pred_delta[: delta_y_abs.shape[1]]):
+            loss += criterion(d, delta_y_abs[:, t])
 
         # Backpropagation
         loss.backward()
         
         # Gradient clipping (for stability)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         # Optimizer step
         optimizer.step()
@@ -297,13 +319,17 @@ def val_loop(model, dataloader, criterion, device):
             y_abs = y_abs.to(device)
 
             # Model forward pass
-            y_pred_abs = model(x_dynamic, x_emb_nav_status, y_abs, p=0.0)
+            y_pred_abs, y_pred_delta = model(x_dynamic, x_emb_nav_status, y_abs, tf=0.0)
             
             # Ensure y_abs is float
             y_abs = y_abs.float()
+            y_pred_delta = [d.float() for d in y_pred_delta]
+            delta_y_abs = y_abs[:, 1:, :2] - y_abs[:, :-1, :2]
 
-            # Compute loss
+            # Compute loss (pos + deltas)
             loss = criterion(y_pred_abs, y_abs)
+            for t, d in enumerate(y_pred_delta[: delta_y_abs.shape[1]]):
+                loss += criterion(d, delta_y_abs[:, t])
 
             # Accumulate loss (no need to clip gradients or optimizer step because no backprop)
             total_loss += loss.item()
@@ -326,8 +352,8 @@ def load_sequences(root):
             dfs = []
             for f in files:
                 df_tmp = pd.read_parquet(f)
-                # Skip short files (shorter than 6 hours of data)
-                if len(df_tmp) < 362:
+                # Skip short files (shorter than 4 hours of data)
+                if len(df_tmp) < 242:
                     continue
                 dfs.append(df_tmp)
 
@@ -362,28 +388,30 @@ def load_sequences(root):
     return sequences
 
 # Create random fixed-length slices from sequences
-def create_random_fixed_length_slices(sequences, slice_length=360):
+def create_random_fixed_length_slices(sequences, slice_length=240, max_slices=3, min_start_idx=2):
     slices = []
-    # Skip sequences shorter than slice_length
+    
     for df in sequences:
         seq_len = len(df)
-        if seq_len < slice_length:
+        if seq_len < slice_length + min_start_idx:
+            #Cannot create any slice from this sequence
             continue
-
-        # Create a random fixed-length slice from the sequence
+        
         max_start = seq_len - slice_length
-
-        # Randomly select a start index for the slice
-        start_idx = np.random.randint(0, max_start + 1)
-
-        # Extract the slice
-        slice_df = df.iloc[start_idx:start_idx + slice_length].reset_index(drop=True)
-
-        # Append the slice to the list
-        slices.append(slice_df)
-
-    print(f"Created {len(slices)} random fixed-length slices (one per sequence)")
-    # Return with fixed length slices
+        # The range of possible start indices
+        possible_starts = np.arange(min_start_idx, max_start + 1)
+        
+        # If there are fewer start indices than max_slices, take as many as available
+        num_slices = min(max_slices, len(possible_starts))
+        
+        # Randomly select start indices without replacement
+        chosen_starts = np.random.choice(possible_starts, size=num_slices, replace=False)
+        
+        for start_idx in chosen_starts:
+            slice_df = df.iloc[start_idx:start_idx + slice_length].reset_index(drop=True)
+            slices.append(slice_df)
+    
+    print(f"Created {len(slices)} random slices (max {max_slices} per sequence)")
     return slices
 
 # Split data into train, val, test sets
@@ -414,7 +442,7 @@ def evaluate_and_save_predictions(model, dataloader, device, output_json="test_p
             y_abs = y_abs.to(device)
 
             # Model prediction
-            y_pred_abs = model(x_dynamic, x_emb_nav_status, y_abs, 0.5)
+            y_pred_abs, y_pred_delta = model(x_dynamic, x_emb_nav_status, y_abs, tf=0.5)
 
             # Convert to numpy
             y_pred_np = y_pred_abs.cpu().numpy()
@@ -456,13 +484,23 @@ def evaluate_and_save_predictions(model, dataloader, device, output_json="test_p
 
     print(f"Saved predictions to {output_json}")
 
+# Check for 'q' key press to quit training early
+def check_for_quit_key():
+    # Non-blocking check for 'q' key press to quit
+    dr,dw,de = select.select([sys.stdin], [], [], 0)
+    if dr:
+        c = sys.stdin.read(1)
+        if c == 'q':
+            return True
+    return False
+
 # Main function
 def main():
 
     # Load and prepare data
     root = os.path.join(os.getcwd(), "data")
     data = load_sequences(root)
-    data = create_random_fixed_length_slices(data, slice_length=360)
+    data = create_random_fixed_length_slices(data, slice_length=240, max_slices=3, min_start_idx=2)
 
     # Initialize model
     model = Seq2SeqDeltaModelAutoregressive(
@@ -478,8 +516,8 @@ def main():
     
     # For Debug: use only a few paths
     if (USE_ONE_PATH):
-        #random 100 data points
-        data = [data[i] for i in np.random.choice(len(data), 100, replace=False)]
+        #random 25 data points
+        data = [data[i] for i in np.random.choice(len(data), 25, replace=False)]
         # train = val = test = data (ONLY FOR DEBUG)
         train_data = data
         val_data = data
@@ -501,7 +539,7 @@ def main():
     # Transfer model to device
     model.to(device)
     # Initialize optimizer and loss function
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
     # Huber loss (Better than MSE for path prediction due to MSE preferencing average paths)
     criterion = nn.SmoothL1Loss()
 
@@ -510,9 +548,9 @@ def main():
     # Number of epochs with no improvement in validation loss
     no_improve_epochs = 0
     # Number of epochs to wait before early stopping
-    debounce = 300
+    debounce = 100
     # Total epochs
-    epochs = 30000
+    epochs = 5000
 
     loss_pairs = []
     for epoch in range(epochs):
@@ -538,6 +576,10 @@ def main():
                 print("Epochs completed:", epoch + 1)
                 print("Best Validation Loss:", prev_val_loss)
                 break
+
+        if check_for_quit_key():
+            print("Quit key 'q' pressed. Stopping training early.")
+            break
 
     # Save the trained model (Not used at the moment)
     torch.save(model.state_dict(), "ship_trajectory_model.pth")

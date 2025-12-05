@@ -1,0 +1,563 @@
+"""
+This script implements a sequence-to-sequence model with attention mechanism
+for ship trajectory prediction using PyTorch. It includes data loading,
+preprocessing, model definition, training with early stopping, and evaluation.
+"""
+
+import os
+import glob
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
+import json
+import argparse
+
+# Use only a few path for quick testing
+USE_ONE_PATH = True
+
+# Argument parser for bsub flag (for jobs on cluster)
+parser = argparse.ArgumentParser()
+parser.add_argument("--isbsub", action="store_true")
+
+args = parser.parse_args()
+if args.isbsub:
+    postifx = "_bsub"
+else:
+    postifx = ""
+
+#Suppress pandas future warning for downcasting
+pd.set_option('future.no_silent_downcasting', True)
+
+# Number of unique navigational statuses
+num_nav_status = 0
+
+# Attention mechanism
+class BahdanauAttention(nn.Module):
+    def __init__(self, enc_hidden_dim, dec_hidden_dim, attn_dim):
+        super().__init__()
+        self.W_h = nn.Linear(enc_hidden_dim, attn_dim, bias=False)
+        self.W_s = nn.Linear(dec_hidden_dim, attn_dim, bias=False)
+        self.v = nn.Linear(attn_dim, 1, bias=False)
+
+    def forward(self, encoder_outputs, decoder_hidden, mask=None):
+        seq_len = encoder_outputs.size(1)
+        decoder_hidden_exp = decoder_hidden.unsqueeze(1).repeat(1, seq_len, 1)
+        # Score calculation
+        score = self.v(torch.tanh(self.W_h(encoder_outputs) + self.W_s(decoder_hidden_exp)))
+        score = score.squeeze(-1)
+        # Filter scores with mask (If the point is padded, set score to -inf)
+        if mask is not None:
+            score = score.masked_fill(~mask, float('-inf'))
+        attn_weights = torch.softmax(score, dim=1).unsqueeze(-1)
+        context = torch.sum(attn_weights * encoder_outputs, dim=1)
+        return context, attn_weights.squeeze(-1)
+
+# NN Model
+class Seq2SeqDeltaModelAutoregressive(nn.Module):
+    def __init__(self,
+                 num_dynamic_features=5,
+                 num_of_nav_status=10,
+                 encoder_hidden_size=128,
+                 attn_dim = 64,
+                 output_size=2,  # output size changed to 2 (no heading)
+                 forecast_steps=60):
+        super().__init__()
+
+        self.forecast_steps = forecast_steps
+        self.output_size = output_size
+        self.encoder_hidden_size = encoder_hidden_size
+
+        # Embedding for navigational status
+        embedding_dim = 16
+        self.cat_embedding = nn.Embedding(num_of_nav_status, embedding_dim, padding_idx=0)
+
+        # Pre-encoder linear layer for dynamic features + embedded nav status
+        self.pre_encoder_dynamic = nn.Sequential(
+            nn.Linear(num_dynamic_features + embedding_dim, encoder_hidden_size),
+            nn.ReLU(),
+        )
+
+        # Encoder LSTM
+        self.encoder_lstm = nn.LSTM(
+            input_size=encoder_hidden_size,
+            hidden_size=encoder_hidden_size,
+            num_layers=2,
+            batch_first=True
+        )
+
+        # Attention mechanism
+        self.attention = BahdanauAttention(encoder_hidden_size, encoder_hidden_size, attn_dim)
+
+        # Decoder LSTM (autoregresszív)
+        self.decoder_lstm = nn.LSTM(
+            input_size=output_size + encoder_hidden_size,  # 2 + 256
+            hidden_size=encoder_hidden_size,
+            num_layers=2,
+            batch_first=True
+        )
+
+        # Linear output layer
+        self.fc_out = nn.Linear(encoder_hidden_size, output_size)
+
+    def forward(self, x_dynamic, x_emb_nav_status, ground_truth, tf=0.8):
+        # Fetch last known position
+        last_known_pos = x_dynamic[:, -1, :2]
+
+        # Create embeddings for categorical features and combine with dynamic features
+        x_embedded = self.cat_embedding(x_emb_nav_status.long())
+
+        # Concatenate dynamic features with embeddings
+        x_combined = torch.cat([x_dynamic, x_embedded], dim=-1)
+
+        # Mask for final NaN handling (Can be deleted I think)
+        mask = ~torch.isnan(x_dynamic).any(dim=-1)
+        lengths = mask.sum(dim=1).cpu()
+
+        # Replace NaN values with 0
+        x_clean = x_combined.clone()
+        x_clean[torch.isnan(x_clean)] = 0.0
+
+        # Preprocessing through the linear layer
+        x_pre = self.pre_encoder_dynamic(x_clean)
+
+        # Pack the sequences so that LSTM ignores the padded parts
+        packed = nn.utils.rnn.pack_padded_sequence(
+            x_pre, lengths, batch_first=True, enforce_sorted=False
+        )
+
+        # Apply encoder LSTM
+        packed_outputs, (h, c) = self.encoder_lstm(packed)
+        # Deconstruct the padded sequence
+        encoder_outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True)
+
+        # Initialize decoder hidden state with encoder's final hidden state
+        decoder_hidden = (h.contiguous(), c.contiguous())
+        pos = last_known_pos
+        abs_outputs = []
+        # Starting input is the last known position
+        decoder_input = pos.unsqueeze(1)
+
+        # Scheduled sampling decay rate
+        tf_decay_rate = tf/self.forecast_steps
+
+        # Autoregressive decoding loop
+        for t in range(self.forecast_steps):
+            # Attention
+            dec_hidden_for_attn = decoder_hidden[0][-1]
+            context_vector, attn_weights = self.attention(encoder_outputs, dec_hidden_for_attn, mask=mask)
+
+            # Decoder LSTM step
+            decoder_lstm_input = torch.cat([decoder_input.squeeze(1), context_vector], dim=-1).unsqueeze(1)
+            out_step, decoder_hidden = self.decoder_lstm(decoder_lstm_input, decoder_hidden)
+            hidden_vec = out_step.squeeze(1)
+
+            # Predicted delta
+            pred_delta = self.fc_out(hidden_vec)
+
+            # Update position
+            pos = pos + pred_delta
+            abs_outputs.append(pos)
+
+            # Scheduled sampling
+            if torch.rand(1).item() < tf:
+                # Ground truth last known pos
+                decoder_input = ground_truth[:, t].unsqueeze(1)
+            else:
+                # Use model's own prediction
+                decoder_input = pos.unsqueeze(1)
+            # Decay tf
+            tf = max(0.0, tf - tf_decay_rate)
+                
+        # Final output tensor
+        abs_outputs = torch.stack(abs_outputs, dim=1)
+        return abs_outputs
+
+# Trajectory dataset type
+class TrajectoryDataset(Dataset):
+    def __init__(self, sequences, forecast_steps=60):
+        self.sequences = sequences
+        self.forecast_steps = forecast_steps
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        df = self.sequences[idx].copy()
+        dynamic_cols = ['Latitude', 'Longitude', 'SOG', 'cos_cog', 'sin_cog', 'vx', 'vy', 'Heading']
+        nav_status_col = 'Navigational status_enum'
+
+        # Fixed split index for 360-length sequences (6 hours of data)
+        # We crop all sequences to 360 length during data loading and slice them into fixed parts
+        # 5 hours known (300 points), 1 hour forecast (60 points)
+        split_idx = 300
+
+        # Dynamic features + navigational status embedding
+        x_dynamic = df.loc[:split_idx-1, dynamic_cols].to_numpy(dtype='float32')
+        x_emb_nav_status = df.loc[:split_idx-1, nav_status_col].to_numpy(dtype='int64')
+
+        # Absolute future points (only lat/lon)
+        y_abs = df.loc[split_idx:split_idx + self.forecast_steps - 1,['Latitude', 'Longitude']].to_numpy(dtype='float32')
+
+        # Data looks like: ( x_dynamic: (300, 8), x_emb_nav_status: (300,), y_abs: (60, 2) )
+        return torch.tensor(x_dynamic), torch.tensor(x_emb_nav_status), torch.tensor(y_abs)
+
+# Collate function for DataLoader to have variable-length sequences in batch (not used with fixed-length slices)
+def collate_fn(batch):
+    x_dynamic_list = []
+    y_abs_list = []
+    x_emb_nav_status_list = []
+
+    lengths = [x_dynamic.shape[0] for (x_dynamic, x_emb_nav_status, y_abs) in batch]
+    max_len = max(lengths)
+
+    for x_dynamic, x_emb_nav_status, y_abs in batch:
+
+        # Convert to tensors if not already
+        if not isinstance(x_dynamic, torch.Tensor):
+            x_dynamic = torch.tensor(x_dynamic, dtype=torch.float32)
+        else:
+            x_dynamic = x_dynamic.detach().clone().float()
+        if not isinstance(y_abs, torch.Tensor):
+            y_abs = torch.tensor(y_abs, dtype=torch.float32)
+        else:
+            y_abs = y_abs.detach().clone().float()
+        if not isinstance(x_emb_nav_status, torch.Tensor):
+            x_emb_nav_status = torch.tensor(x_emb_nav_status, dtype=torch.int64)
+        else:
+            x_emb_nav_status = x_emb_nav_status.detach().clone().long()
+
+        # Padding with NaNs
+        pad_len = max_len - x_dynamic.shape[0]
+        if pad_len > 0:
+            pad = torch.full((pad_len, x_dynamic.shape[1]), float('nan'))
+            x_dynamic = torch.cat([x_dynamic, pad], dim=0)
+            pad_y = torch.full((pad_len, y_abs.shape[1]), float('nan'))
+            y_abs = torch.cat([y_abs, pad_y], dim=0)
+            pad_emb = torch.full((pad_len,), 0, dtype=torch.int64)
+            x_emb_nav_status = torch.cat([x_emb_nav_status, pad_emb], dim=0)
+
+        # Append to lists
+        x_dynamic_list.append(x_dynamic)
+        y_abs_list.append(y_abs)
+        x_emb_nav_status_list.append(x_emb_nav_status)
+
+    # Stack into batches
+    x_dynamic_batch = torch.stack(x_dynamic_list)
+    y_abs_batch = torch.stack(y_abs_list)
+    x_emb_nav_status_batch = torch.stack(x_emb_nav_status_list)
+
+    # Return batched tensors. Looks like: ( x_dynamic: (batch_size, max_len, 8), x_emb_nav_status: (batch_size, max_len), y_abs: (batch_size, max_len, 2) )
+    return x_dynamic_batch, x_emb_nav_status_batch, y_abs_batch
+
+# Training loop
+def train_loop(model, dataloader, optimizer, criterion, device):
+    # Set model to training mode
+    model.train()
+    total_loss = 0
+    for x_dynamic, x_emb_nav_status, y_abs in dataloader:
+        # Move data to device
+        x_dynamic = x_dynamic.to(device)
+        x_emb_nav_status = x_emb_nav_status.to(device)
+        y_abs = y_abs.to(device)
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Try model forward pass
+        y_pred_abs = model(x_dynamic, x_emb_nav_status, y_abs, 0.8)
+
+        # Ensure y_abs is float
+        y_abs = y_abs.float()
+
+        # Compute loss
+        loss = criterion(y_pred_abs, y_abs)
+
+        # Backpropagation
+        loss.backward()
+        
+        # Gradient clipping (for stability)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # Optimizer step
+        optimizer.step()
+
+        # Accumulate loss
+        total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+# Validation loop
+def val_loop(model, dataloader, criterion, device):
+    # Set model to evaluation mode
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for x_dynamic, x_emb_nav_status, y_abs in dataloader:
+            # Move data to device
+            x_dynamic = x_dynamic.to(device)
+            x_emb_nav_status = x_emb_nav_status.to(device)
+            y_abs = y_abs.to(device)
+
+            # Model forward pass
+            y_pred_abs = model(x_dynamic, x_emb_nav_status, y_abs, 0.0)
+            
+            # Ensure y_abs is float
+            y_abs = y_abs.float()
+
+            # Compute loss
+            loss = criterion(y_pred_abs, y_abs)
+
+            # Accumulate loss (no need to clip gradients or optimizer step because no backprop)
+            total_loss += loss.item()
+    return total_loss / len(dataloader)
+
+# Load sequences from data directory
+def load_sequences(root):
+    global num_nav_status
+
+    sequences = []
+
+    # For each trajectory (segment) in the dataset
+    for mmsi_folder in glob.glob(os.path.join(root, "MMSI=*")):
+        for seg_folder in glob.glob(os.path.join(mmsi_folder, "segment=*")):
+            files = glob.glob(os.path.join(seg_folder, "*.parquet"))
+            if not files:
+                continue
+
+            # Load and concatenate all parquet files in the segment
+            dfs = []
+            for f in files:
+                df_tmp = pd.read_parquet(f)
+                # Skip short files (shorter than 6 hours of data)
+                if len(df_tmp) < 362:
+                    continue
+                dfs.append(df_tmp)
+
+            # If after filtering there are no valid files, skip
+            if not dfs:
+                continue
+
+            df = pd.concat(dfs, ignore_index=True)
+
+            # Sort by timestamp if available
+            if "Timestamp" in df.columns:
+                df = df.sort_values("Timestamp").reset_index(drop=True)
+
+            # Shift enums by +1 to fix -1 values (During calculating enums, -1 was used for NaN)
+            for col in ['Ship type_enum', 'Cargo type_enum', 'Navigational status_enum']:
+                if col in df.columns:
+                    df[col] = df[col].apply(lambda x: x + 1 if x >= 0 else 0)
+
+            sequences.append(df)
+
+    # Combine all sequences
+    combined_df = pd.concat(sequences, ignore_index=True)
+
+    # Determine number of unique navigational statuses for embedding size
+    num_nav_status = combined_df['Navigational status_enum'].max() + 1
+
+    # Debug only (print stats)
+    print("Max Navigational status_enum:", combined_df['Navigational status_enum'].max())
+    print("Num navigational statuses (embedding size):", num_nav_status)
+
+    # Return with filtered sequences that look like ( pd.DataFrame1, pd.DataFrame2, ... )
+    return sequences
+
+# Create random fixed-length slices from sequences
+def create_random_fixed_length_slices(sequences, slice_length=360):
+    slices = []
+    # Skip sequences shorter than slice_length
+    for df in sequences:
+        seq_len = len(df)
+        if seq_len < slice_length:
+            continue
+
+        # Create a random fixed-length slice from the sequence
+        max_start = seq_len - slice_length
+
+        # Randomly select a start index for the slice
+        start_idx = np.random.randint(0, max_start + 1)
+
+        # Extract the slice
+        slice_df = df.iloc[start_idx:start_idx + slice_length].reset_index(drop=True)
+
+        # Append the slice to the list
+        slices.append(slice_df)
+
+    print(f"Created {len(slices)} random fixed-length slices (one per sequence)")
+    # Return with fixed length slices
+    return slices
+
+# Split data into train, val, test sets
+def split_data(sequences, val_ratio=0.1, test_ratio=0.1, random_state=1234):
+    # First split off the test set
+    train_and_val, test = train_test_split(sequences, test_size=test_ratio, random_state=random_state)
+
+    # Then split train and validation sets
+    train, val = train_test_split(train_and_val, test_size=val_ratio/(1 - test_ratio), random_state=random_state)
+
+    print(f"Data split: Train={len(train)}, Val={len(val)}, Test={len(test)}")
+
+    # Return with the split datasets
+    return train, val, test
+
+# Evaluate on the test set and save predictions to JSON for further visualizations
+def evaluate_and_save_predictions(model, dataloader, device, output_json="test_predictions.json"):
+    # Evaluate model
+    model.eval()
+    results = []
+
+    with torch.no_grad():
+        seq_id = 0
+        for x_dynamic, x_emb_nav_status, y_abs in dataloader:
+            # Move data to device
+            x_dynamic = x_dynamic.to(device)
+            x_emb_nav_status = x_emb_nav_status.to(device)
+            y_abs = y_abs.to(device)
+
+            # Model prediction
+            y_pred_abs = model(x_dynamic, x_emb_nav_status, y_abs)
+
+            # Convert to numpy
+            y_pred_np = y_pred_abs.cpu().numpy()
+            y_true_np = y_abs.cpu().numpy()
+            x_dynamic_np = x_dynamic.cpu().numpy()
+
+            # Iterate over the batch
+            for i in range(len(y_pred_np)):
+                
+                # Get absolute predictions
+                abs_preds = y_pred_np[i]
+
+                # JSON format:
+                # {"sequence_id": int,
+                # "known_path": [ {"lat": float, "lon": float}, ... ],
+                # "ground_truth": [ {"lat": float, "lon": float}, ... ],
+                # "prediction": [ {"lat": float, "lon": float}, ... ]}
+                results.append({
+                    "sequence_id": seq_id,
+                    "known_path": [
+                        {"lat": float(p[0]), "lon": float(p[1])}
+                        for p in x_dynamic_np[i][:, :2] if not (p[0] == 0.0 and p[1] == 0.0)
+                    ],
+                    "ground_truth": [
+                        {"lat": float(p[0]), "lon": float(p[1])}
+                        for p in y_true_np[i]
+                    ],
+                    "prediction": [
+                        {"lat": float(p[0]), "lon": float(p[1])}
+                        for p in abs_preds[:, 0:2]
+                    ]
+                })
+
+                seq_id += 1
+
+    # Save to JSON file
+    with open(output_json, "w") as f:
+        json.dump(results, f, indent=4)
+
+    print(f"Saved predictions to {output_json}")
+
+# Main function
+def main():
+
+    # Load and prepare data
+    root = os.path.join(os.getcwd(), "data")
+    data = load_sequences(root)
+    data = create_random_fixed_length_slices(data, slice_length=360)
+
+    # Initialize model
+    model = Seq2SeqDeltaModelAutoregressive(
+        num_dynamic_features=8,                                 # Latitude, Longitude, SOG, cos_cog, sin_cog, vx, vy, Heading
+        num_of_nav_status=num_nav_status,                       # Number of unique navigational statusess
+        encoder_hidden_size=256,                                # Hidden size of encoder and decoder LSTMs (tuneable)
+        output_size=2,                                          # Latitude and Longitude
+        forecast_steps=60                                       # Forecasting 1 hour ahead
+    )
+
+    # Check number of trainable parameters
+    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
+    
+    # For Debug: use only a few paths
+    if (USE_ONE_PATH):
+        #random 100 data points
+        data = [data[i] for i in np.random.choice(len(data), 100, replace=False)]
+        # train = val = test = data (ONLY FOR DEBUG)
+        train_data = data
+        val_data = data
+        test_data = data
+    else:
+        # Split data into train, validation, and test sets
+        train_data, val_data, test_data = split_data(data)
+
+    # Create datasets and dataloaders
+    train_ds = TrajectoryDataset(train_data)
+    train_dl = DataLoader(train_ds, batch_size=128, shuffle=True, collate_fn=collate_fn)
+    validation_ds = TrajectoryDataset(val_data)
+    validation_dl = DataLoader(validation_ds, batch_size=128, shuffle=False, collate_fn=collate_fn)
+    test_ds = TrajectoryDataset(test_data)
+    test_dl = DataLoader(test_ds, batch_size=128, shuffle=False, collate_fn=collate_fn)
+
+    # Training setup (CUDA or CPU)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Transfer model to device
+    model.to(device)
+    # Initialize optimizer and loss function
+    #optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-5)
+    # Huber loss (Better than MSE for path prediction due to MSE preferencing average paths)
+    criterion = nn.SmoothL1Loss()
+
+    # Training loop with early stopping
+    prev_val_loss = float('inf')
+    # Number of epochs with no improvement in validation loss
+    no_improve_epochs = 0
+    # Number of epochs to wait before early stopping
+    debounce = 300
+    # Total epochs
+    epochs = 3000
+
+    loss_pairs = []
+    for epoch in range(epochs):
+        # Training step
+        train_loss = train_loop(model, train_dl, optimizer, criterion, device)
+        print(f"Epoch {epoch+1}/{epochs} Train Loss: {train_loss:.15f}")
+
+        # Validation step
+        validation_loss = val_loop(model, validation_dl, criterion, device)
+        print(f"Epoch {epoch+1}/{epochs} Validation Loss: {validation_loss:.15f}")
+
+        # Record losses for plotting later
+        loss_pairs.append((train_loss, validation_loss))
+
+        # Early stopping check
+        if validation_loss < prev_val_loss:
+            no_improve_epochs = 0
+            prev_val_loss = validation_loss
+        else:
+            no_improve_epochs += 1
+            if no_improve_epochs >= debounce:
+                print("Early stopping triggered.")
+                print("Epochs completed:", epoch + 1)
+                print("Best Validation Loss:", prev_val_loss)
+                break
+
+    # Save the trained model (Not used at the moment)
+    torch.save(model.state_dict(), "ship_trajectory_model.pth")
+    print("Model saved to ship_trajectory_model.pth")
+
+    # Write loss pairs to JSON for plotting. JSON format: [ {"train_loss": float, "val_loss": float}, ... ]
+    with open("loss_pairs"+postifx+".json", "w") as f:
+        json.dump([{"train_loss": tl, "val_loss": vl} for tl, vl in loss_pairs], f, indent=2)
+
+    # Evaluate on test set and save predictions to JSON
+    evaluate_and_save_predictions(model, test_dl, device, output_json="test_predictions"+postifx+".json")
+
+    # Also evaluate on train set and save predictions to JSON (for overfitting analysis)
+    evaluate_and_save_predictions(model, train_dl, device, output_json="train_predictions"+postifx+".json")
+
+if __name__ == "__main__":
+    main()
