@@ -62,3 +62,4 @@ Raw data is available from:
 ## Other files
 
 Additional scripts and the data are also available in the repository. These scripts served as backups at each milestone.
+Results can be found under its corresponding folder.
