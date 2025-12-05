@@ -34,9 +34,9 @@ Raw data is available from:
 
 ## Training
 
-1. Run `main.py`  
-   This script handles all neural network training components. It does not accept tunable parameters externally.  
-   After training, it saves the model to a `.pth` file, applies the model to the test set, and generates a `.json` file with all predicted data.  
+1. Run `main_baseline.py` and  `main_improvement.py` 
+   This scripts handle all neural network training components. They do not accept tunable parameters externally.  
+   After training, they save the model to a `.pth` file, applies the model to the test set, and generates a `.json` file with all predicted data.  
    (For debugging purposes, an additional JSON file is created to visualize training predictions.)
 
 2. **Optional:** Visualization on a map  
@@ -56,3 +56,4 @@ Raw data is available from:
    Example usage:  
    ```bash
    python ./loss_pair_visualization.py --start 0 --end 150
+
